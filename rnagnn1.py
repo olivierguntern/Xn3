@@ -486,14 +486,19 @@ if TORCH_AVAILABLE:
             return self.out(torch.cat([h.mean(0), h.max(0)[0]]))
 
     def train_gnn(templates, epochs=30, hidden=32, layers=2):
+        import time
         print(f"🏋️ Entraînement GNN sur {len(templates)} templates...")
+        print(f"   Device: {DEVICE}")
+        start_time = time.time()
+
         model = RNAGNN(hidden=hidden, layers=layers).to(DEVICE)
         opt = torch.optim.Adam(model.parameters(), lr=0.001)
 
         model.train()
         for ep in range(epochs):
+            epoch_start = time.time()
             total_loss, n = 0, 0
-            for t in templates:
+            for idx, t in enumerate(templates):
                 seq, coords = t['sequence'], t['coords']
                 node_f = torch.tensor(np.concatenate([seq_to_onehot(seq), coords_to_features(coords)], 1), dtype=torch.float32).to(DEVICE)
                 edges, edge_f = build_graph(coords)
@@ -517,10 +522,15 @@ if TORCH_AVAILABLE:
                 total_loss += loss.item()
                 n += 1
 
-            if (ep + 1) % 10 == 0:
-                print(f"   Epoch {ep + 1}/{epochs} - Loss: {total_loss / n:.4f}")
+                # Affichage progression intra-epoch
+                if (idx + 1) % 50 == 0:
+                    print(f"   Epoch {ep+1}/{epochs} - Template {idx+1}/{len(templates)}", end='\r')
 
-        print("✅ GNN entraîné")
+            epoch_time = time.time() - epoch_start
+            print(f"   Epoch {ep+1:2d}/{epochs} - Loss: {total_loss/n:.4f} - {epoch_time:.1f}s")
+
+        total_time = time.time() - start_time
+        print(f"✅ GNN entraîné en {total_time:.1f}s")
         return model
 
     def score_gnn(model, seq, coords):
