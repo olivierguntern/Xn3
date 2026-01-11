@@ -2049,14 +2049,344 @@ def generate_submission(test_sequences_df, templates_db, output_path='submission
 # submission = generate_submission(test_sequences, templates_db, 'submission.csv')
 
 # %% [markdown]
-# ## 🎯 13. Résumé de la stratégie
+# ## 🧠 13. GNN Energy-Based Model (Optionnel)
+#
+# Module GNN léger pour un scoring plus sophistiqué.
+# Nécessite PyTorch (disponible sur Kaggle).
+
+# %%
+# ============================================================
+# INTÉGRATION DU GNN EBM (optionnel - nécessite PyTorch)
+# ============================================================
+
+# Vérifier si PyTorch est disponible
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    TORCH_AVAILABLE = True
+    print("✅ PyTorch disponible - GNN EBM activé")
+except ImportError:
+    TORCH_AVAILABLE = False
+    print("⚠️ PyTorch non disponible - GNN EBM désactivé")
+
+# %% [markdown]
+# ### 13.1 Architecture GNN
+
+# %%
+if TORCH_AVAILABLE:
+    # Encodage des nucléotides
+    NUCLEOTIDE_TO_IDX = {'A': 0, 'U': 1, 'G': 2, 'C': 3, 'N': 4}
+    NUM_NUCLEOTIDES = 5
+
+    def sequence_to_onehot(sequence):
+        """Convertit une séquence RNA en encodage one-hot."""
+        n = len(sequence)
+        onehot = np.zeros((n, NUM_NUCLEOTIDES), dtype=np.float32)
+        for i, nuc in enumerate(sequence):
+            idx = NUCLEOTIDE_TO_IDX.get(nuc, 4)
+            onehot[i, idx] = 1.0
+        return onehot
+
+    def coords_to_node_features(coords):
+        """Extrait des features géométriques des coordonnées."""
+        coords = np.array(coords, dtype=np.float32)
+        n = len(coords)
+        valid_mask = ~np.all(coords == 0, axis=1)
+
+        if np.sum(valid_mask) > 0:
+            centroid = np.mean(coords[valid_mask], axis=0)
+        else:
+            centroid = np.zeros(3)
+
+        features = []
+        for i in range(n):
+            if not valid_mask[i]:
+                features.append([0.0] * 9)
+                continue
+
+            rel_pos = coords[i] - centroid
+            dist_to_center = np.linalg.norm(rel_pos)
+
+            if i < n - 1 and valid_mask[i + 1]:
+                direction = coords[i + 1] - coords[i]
+                direction = direction / (np.linalg.norm(direction) + 1e-8)
+            else:
+                direction = np.zeros(3)
+
+            rel_pos_norm = rel_pos / (np.linalg.norm(rel_pos) + 1e-8)
+            feat = list(rel_pos_norm) + [dist_to_center / 50.0] + list(direction) + [i / n, (n - i) / n]
+            features.append(feat)
+
+        return np.array(features, dtype=np.float32)
+
+    def build_rna_graph(coords, k_neighbors=5, max_dist=15.0):
+        """Construit les arêtes du graphe RNA."""
+        n = len(coords)
+        coords = np.array(coords, dtype=np.float32)
+        edges, edge_features = [], []
+
+        # Connexions séquentielles
+        for i in range(n - 1):
+            dist = np.linalg.norm(coords[i + 1] - coords[i])
+            edges.extend([[i, i + 1], [i + 1, i]])
+            edge_features.extend([[dist / 10.0, 1.0, 0.0], [dist / 10.0, 1.0, 0.0]])
+
+        # K plus proches voisins
+        valid_mask = ~np.all(coords == 0, axis=1)
+        for i in range(n):
+            if not valid_mask[i]:
+                continue
+            distances = []
+            for j in range(n):
+                if i == j or abs(i - j) <= 1 or not valid_mask[j]:
+                    distances.append(float('inf'))
+                else:
+                    distances.append(np.linalg.norm(coords[i] - coords[j]))
+
+            nearest = np.argsort(distances)[:k_neighbors]
+            for j in nearest:
+                if distances[j] < max_dist:
+                    is_contact = 1.0 if distances[j] < 8.0 else 0.0
+                    edges.append([i, j])
+                    edge_features.append([distances[j] / 10.0, 0.0, is_contact])
+
+        if not edges:
+            edges, edge_features = [[0, 0]], [[0.0, 0.0, 0.0]]
+
+        return np.array(edges, dtype=np.int64), np.array(edge_features, dtype=np.float32)
+
+    class GraphConvLayer(nn.Module):
+        """Couche de convolution sur graphe."""
+        def __init__(self, in_dim, out_dim, edge_dim=3):
+            super().__init__()
+            self.linear_self = nn.Linear(in_dim, out_dim)
+            self.linear_neighbor = nn.Linear(in_dim, out_dim)
+            self.linear_edge = nn.Linear(edge_dim, out_dim)
+            self.norm = nn.LayerNorm(out_dim)
+
+        def forward(self, x, edge_index, edge_attr):
+            h_self = self.linear_self(x)
+            h_neighbor = torch.zeros_like(h_self)
+
+            for idx, (src, tgt) in enumerate(edge_index):
+                src, tgt = int(src), int(tgt)
+                msg = self.linear_neighbor(x[src]) * torch.sigmoid(self.linear_edge(edge_attr[idx]))
+                h_neighbor[tgt] += msg
+
+            h = self.norm(h_self + h_neighbor)
+            return F.relu(h)
+
+    class RNAGraphNet(nn.Module):
+        """GNN léger pour scorer les structures RNA."""
+        def __init__(self, node_in_dim=14, hidden_dim=64, num_layers=3, edge_dim=3):
+            super().__init__()
+            self.input_proj = nn.Linear(node_in_dim, hidden_dim)
+            self.conv_layers = nn.ModuleList([
+                GraphConvLayer(hidden_dim, hidden_dim, edge_dim) for _ in range(num_layers)
+            ])
+            self.output_mlp = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1)
+            )
+
+        def forward(self, x, edge_index, edge_attr):
+            h = self.input_proj(x)
+            for conv in self.conv_layers:
+                h = h + conv(h, edge_index, edge_attr)
+            h_global = torch.cat([h.mean(dim=0), h.max(dim=0)[0]])
+            return self.output_mlp(h_global)
+
+    print("✅ Architecture GNN définie")
+
+# %% [markdown]
+# ### 13.2 Entraînement du GNN
+
+# %%
+if TORCH_AVAILABLE:
+    def train_gnn_on_templates(templates_db, epochs=30, hidden_dim=64, num_layers=3, device='cpu'):
+        """Entraîne le GNN sur les templates PDB."""
+        print(f"🏋️ Entraînement GNN sur {len(templates_db)} templates...")
+
+        model = RNAGraphNet(node_in_dim=14, hidden_dim=hidden_dim, num_layers=num_layers).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+        # Préparer les données
+        structures = [{'sequence': t['sequence'], 'coords': t['coords']} for t in templates_db]
+
+        model.train()
+        for epoch in range(epochs):
+            total_loss = 0
+            n_samples = 0
+
+            for struct in structures:
+                seq, coords = struct['sequence'], struct['coords']
+
+                # Structure réelle (basse énergie)
+                seq_oh = sequence_to_onehot(seq)
+                coord_feat = coords_to_node_features(coords)
+                node_feat = torch.tensor(np.concatenate([seq_oh, coord_feat], axis=1), dtype=torch.float32).to(device)
+                edges, edge_feat = build_rna_graph(coords)
+                edge_idx = torch.tensor(edges, dtype=torch.long).to(device)
+                edge_attr = torch.tensor(edge_feat, dtype=torch.float32).to(device)
+
+                energy_real = model(node_feat, edge_idx, edge_attr)
+                loss_real = F.binary_cross_entropy(torch.sigmoid(energy_real), torch.tensor([[0.0]]).to(device))
+
+                # Structure perturbée (haute énergie)
+                perturbed = [(c[0] + np.random.normal(0, 5), c[1] + np.random.normal(0, 5), c[2] + np.random.normal(0, 5))
+                             if c != (0.0, 0.0, 0.0) else c for c in coords]
+                coord_feat_p = coords_to_node_features(perturbed)
+                node_feat_p = torch.tensor(np.concatenate([seq_oh, coord_feat_p], axis=1), dtype=torch.float32).to(device)
+                edges_p, edge_feat_p = build_rna_graph(perturbed)
+                edge_idx_p = torch.tensor(edges_p, dtype=torch.long).to(device)
+                edge_attr_p = torch.tensor(edge_feat_p, dtype=torch.float32).to(device)
+
+                energy_pert = model(node_feat_p, edge_idx_p, edge_attr_p)
+                loss_pert = F.binary_cross_entropy(torch.sigmoid(energy_pert), torch.tensor([[1.0]]).to(device))
+
+                loss = loss_real + loss_pert
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+                n_samples += 1
+
+            if (epoch + 1) % 10 == 0:
+                print(f"   Epoch {epoch+1}/{epochs} - Loss: {total_loss/n_samples:.4f}")
+
+        print("✅ Entraînement GNN terminé")
+        return model
+
+    def score_with_gnn(model, sequence, coords, device='cpu'):
+        """Score une structure avec le GNN (0-1, plus haut = meilleur)."""
+        model.eval()
+        with torch.no_grad():
+            seq_oh = sequence_to_onehot(sequence)
+            coord_feat = coords_to_node_features(coords)
+            node_feat = torch.tensor(np.concatenate([seq_oh, coord_feat], axis=1), dtype=torch.float32).to(device)
+            edges, edge_feat = build_rna_graph(coords)
+            edge_idx = torch.tensor(edges, dtype=torch.long).to(device)
+            edge_attr = torch.tensor(edge_feat, dtype=torch.float32).to(device)
+            energy = model(node_feat, edge_idx, edge_attr)
+            return 1.0 - torch.sigmoid(energy).item()
+
+    print("✅ Fonctions d'entraînement GNN définies")
+
+# %% [markdown]
+# ### 13.3 Test du GNN sur les templates
+
+# %%
+# Entraîner le GNN si PyTorch disponible et templates existants
+gnn_model = None
+
+if TORCH_AVAILABLE and templates_db:
+    # Utiliser un sous-ensemble pour la démo (plus rapide)
+    train_templates = templates_db[:min(100, len(templates_db))]
+
+    if len(train_templates) > 0:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"📱 Device: {device}")
+
+        gnn_model = train_gnn_on_templates(train_templates, epochs=30, hidden_dim=32, num_layers=2, device=device)
+
+        # Test sur quelques structures
+        print("\n📊 Test du GNN:")
+        for t in train_templates[:3]:
+            score = score_with_gnn(gnn_model, t['sequence'], t['coords'], device)
+            print(f"   {t['pdb_id']}_{t['chain_id']}: score GNN = {score:.4f}")
+
+# %% [markdown]
+# ### 13.4 Génération avec GNN
+
+# %%
+def generate_submission_with_gnn(test_sequences_df, templates_db, gnn_model=None, output_path='submission.csv', use_msa=True, device='cpu'):
+    """
+    Génère la soumission en utilisant le GNN pour scorer et classer les prédictions.
+    """
+    print("📝 Génération de la soumission avec GNN...")
+
+    msa_dir = DATA_PATH / 'MSA' if use_msa else None
+    if use_msa:
+        print("   🧬 MSA activé")
+    if gnn_model is not None:
+        print("   🧠 GNN activé")
+
+    rows = []
+
+    for idx, row in test_sequences_df.iterrows():
+        target_id = row['target_id']
+        query_seq = row['sequence']
+
+        # Générer 5 prédictions avec EBM simple
+        predictions = generate_diverse_predictions(
+            query_seq, templates_db,
+            target_id=target_id, msa_dir=msa_dir, use_ebm=True
+        )
+
+        # Re-classer avec GNN si disponible
+        if gnn_model is not None and TORCH_AVAILABLE:
+            scored = [(score_with_gnn(gnn_model, query_seq, pred, device), pred) for pred in predictions]
+            scored.sort(key=lambda x: x[0], reverse=True)
+            predictions = [pred for _, pred in scored]
+
+        # Créer les lignes pour chaque résidu
+        for resid, nucleotide in enumerate(query_seq, start=1):
+            row_data = {
+                'ID': f"{target_id}_{resid}",
+                'resname': nucleotide,
+                'resid': resid
+            }
+
+            for pred_idx, pred_coords in enumerate(predictions, start=1):
+                if resid - 1 < len(pred_coords):
+                    x, y, z = pred_coords[resid - 1]
+                else:
+                    x, y, z = 0.0, 0.0, 0.0
+
+                x = np.clip(x, -999.999, 9999.999)
+                y = np.clip(y, -999.999, 9999.999)
+                z = np.clip(z, -999.999, 9999.999)
+
+                row_data[f'x_{pred_idx}'] = round(x, 3)
+                row_data[f'y_{pred_idx}'] = round(y, 3)
+                row_data[f'z_{pred_idx}'] = round(z, 3)
+
+            rows.append(row_data)
+
+        if idx % 10 == 0:
+            print(f"   Progression: {idx + 1}/{len(test_sequences_df)}")
+
+    submission_df = pd.DataFrame(rows)
+    coord_cols = []
+    for i in range(1, 6):
+        coord_cols.extend([f'x_{i}', f'y_{i}', f'z_{i}'])
+    submission_df = submission_df[['ID', 'resname', 'resid'] + coord_cols]
+    submission_df.to_csv(output_path, index=False)
+
+    print(f"✅ Soumission générée: {output_path}")
+    print(f"   Shape: {submission_df.shape}")
+
+    return submission_df
+
+# Génération avec GNN (décommentez pour exécuter)
+# device = 'cuda' if torch.cuda.is_available() else 'cpu'
+# submission = generate_submission_with_gnn(test_sequences, templates_db, gnn_model, 'submission.csv', device=device)
+
+# %% [markdown]
+# ## 🎯 14. Résumé de la stratégie
 
 # %%
 print("=" * 70)
 print("               🎯 RÉSUMÉ DE LA STRATÉGIE TBM")
 print("=" * 70)
 print("""
-📋 PIPELINE TBM + MSA + EBM IMPLÉMENTÉ:
+📋 PIPELINE COMPLET TBM + MSA + EBM + GNN:
 
 1. EXTRACTION DES TEMPLATES
    • Parser les fichiers CIF du PDB_RNA
@@ -2066,34 +2396,32 @@ print("""
 2. EXPLOITATION DES MSA
    • Extraction des IDs PDB des homologues
    • Calcul des scores de conservation
-   • Bonus pour les templates trouvés via MSA (x1.5)
+   • Bonus pour les templates MSA (x1.5)
 
-3. RECHERCHE DE TEMPLATES (MSA-améliorée)
+3. RECHERCHE DE TEMPLATES
    • Alignement pondéré par conservation
-   • Priorité aux templates MSA
-   • Score combiné: similarité + longueur + conservation
+   • Score combiné: similarité + longueur
 
-4. ENERGY-BASED MODEL (EBM) ✨ NOUVEAU
-   • Scoring basé sur contraintes physiques
+4. EBM SIMPLE (règles physiques)
    • Distances C1'-C1' (~5.9Å)
    • Évitement des clashes stériques
    • Rayon de giration réaliste
-   • Raffinement par minimisation d'énergie
+   • Raffinement rapide CPU
 
-5. DIVERSIFICATION (5 prédictions)
-   • Prédiction 1-3: Top 3 templates
-   • Prédiction 4: Moyenne des 2 meilleurs
-   • Prédiction 5: Perturbation aléatoire
-   • Toutes raffinées et triées par score EBM
+5. GNN EBM (optionnel, PyTorch)
+   • Architecture légère (~50K params)
+   • Entraîné sur templates PDB
+   • Scoring appris des structures
+   • Re-classement des prédictions
 
-📈 AMÉLIORATIONS POSSIBLES:
-   • Alignement avec gaps (Needleman-Wunsch)
-   • Rotation/translation optimale (Kabsch algorithm)
-   • EBM appris sur données PDB
+6. DIVERSIFICATION (5 prédictions)
+   • Top 3 templates différents
+   • Moyenne des meilleurs
+   • Perturbation aléatoire
+   • Triées par score EBM/GNN
 
-🚀 Pour soumettre:
-   1. Décommenter la génération de soumission
-   2. Utiliser tous les fichiers PDB (max_files=None)
-   3. use_msa=True, use_ebm=True (défauts)
+🚀 POUR SOUMETTRE:
+   Option 1 (CPU): generate_submission(test_sequences, templates_db)
+   Option 2 (GPU): generate_submission_with_gnn(test_sequences, templates_db, gnn_model)
 """.format(n_templates=len(templates_db)))
 print("=" * 70)
