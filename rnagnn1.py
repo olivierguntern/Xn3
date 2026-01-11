@@ -501,14 +501,14 @@ if TORCH_AVAILABLE:
 
                 # Réel
                 e_real = model(node_f, edges_t, edge_f_t)
-                loss_r = F.binary_cross_entropy(torch.sigmoid(e_real), torch.tensor([[0.0]]).to(DEVICE))
+                loss_r = F.binary_cross_entropy(torch.sigmoid(e_real), torch.tensor([0.0]).to(DEVICE))
 
                 # Perturbé
                 pert = [(c[0] + np.random.normal(0, 5), c[1] + np.random.normal(0, 5), c[2] + np.random.normal(0, 5)) if c != (0, 0, 0) else c for c in coords]
                 node_p = torch.tensor(np.concatenate([seq_to_onehot(seq), coords_to_features(pert)], 1), dtype=torch.float32).to(DEVICE)
                 edges_p, edge_p = build_graph(pert)
                 e_pert = model(node_p, torch.tensor(edges_p).to(DEVICE), torch.tensor(edge_p, dtype=torch.float32).to(DEVICE))
-                loss_p = F.binary_cross_entropy(torch.sigmoid(e_pert), torch.tensor([[1.0]]).to(DEVICE))
+                loss_p = F.binary_cross_entropy(torch.sigmoid(e_pert), torch.tensor([1.0]).to(DEVICE))
 
                 loss = loss_r + loss_p
                 opt.zero_grad()
