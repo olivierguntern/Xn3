@@ -485,10 +485,11 @@ if TORCH_AVAILABLE:
                 h = h + conv(h, edges, edge_attr)
             return self.out(torch.cat([h.mean(0), h.max(0)[0]]))
 
-    def train_gnn(templates, epochs=30, hidden=32, layers=2):
+    def train_gnn(templates, epochs=20, hidden=32, layers=2):
         import time
-        print(f"🏋️ Entraînement GNN sur {len(templates)} templates...")
-        print(f"   Device: {DEVICE}")
+        import sys
+        print(f"🏋️ Entraînement GNN sur {len(templates)} templates...", flush=True)
+        print(f"   Device: {DEVICE}", flush=True)
         start_time = time.time()
 
         model = RNAGNN(hidden=hidden, layers=layers).to(DEVICE)
@@ -500,37 +501,39 @@ if TORCH_AVAILABLE:
             total_loss, n = 0, 0
             for idx, t in enumerate(templates):
                 seq, coords = t['sequence'], t['coords']
-                node_f = torch.tensor(np.concatenate([seq_to_onehot(seq), coords_to_features(coords)], 1), dtype=torch.float32).to(DEVICE)
-                edges, edge_f = build_graph(coords)
-                edges_t, edge_f_t = torch.tensor(edges).to(DEVICE), torch.tensor(edge_f, dtype=torch.float32).to(DEVICE)
 
-                # Réel
-                e_real = model(node_f, edges_t, edge_f_t)
-                loss_r = F.binary_cross_entropy(torch.sigmoid(e_real), torch.tensor([0.0]).to(DEVICE))
+                try:
+                    node_f = torch.tensor(np.concatenate([seq_to_onehot(seq), coords_to_features(coords)], 1), dtype=torch.float32).to(DEVICE)
+                    edges, edge_f = build_graph(coords)
+                    edges_t, edge_f_t = torch.tensor(edges).to(DEVICE), torch.tensor(edge_f, dtype=torch.float32).to(DEVICE)
 
-                # Perturbé
-                pert = [(c[0] + np.random.normal(0, 5), c[1] + np.random.normal(0, 5), c[2] + np.random.normal(0, 5)) if c != (0, 0, 0) else c for c in coords]
-                node_p = torch.tensor(np.concatenate([seq_to_onehot(seq), coords_to_features(pert)], 1), dtype=torch.float32).to(DEVICE)
-                edges_p, edge_p = build_graph(pert)
-                e_pert = model(node_p, torch.tensor(edges_p).to(DEVICE), torch.tensor(edge_p, dtype=torch.float32).to(DEVICE))
-                loss_p = F.binary_cross_entropy(torch.sigmoid(e_pert), torch.tensor([1.0]).to(DEVICE))
+                    # Réel
+                    e_real = model(node_f, edges_t, edge_f_t)
+                    loss_r = F.binary_cross_entropy(torch.sigmoid(e_real), torch.tensor([0.0]).to(DEVICE))
 
-                loss = loss_r + loss_p
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-                total_loss += loss.item()
-                n += 1
+                    # Perturbé
+                    pert = [(c[0] + np.random.normal(0, 5), c[1] + np.random.normal(0, 5), c[2] + np.random.normal(0, 5)) if c != (0, 0, 0) else c for c in coords]
+                    node_p = torch.tensor(np.concatenate([seq_to_onehot(seq), coords_to_features(pert)], 1), dtype=torch.float32).to(DEVICE)
+                    edges_p, edge_p = build_graph(pert)
+                    e_pert = model(node_p, torch.tensor(edges_p).to(DEVICE), torch.tensor(edge_p, dtype=torch.float32).to(DEVICE))
+                    loss_p = F.binary_cross_entropy(torch.sigmoid(e_pert), torch.tensor([1.0]).to(DEVICE))
 
-                # Affichage progression intra-epoch
-                if (idx + 1) % 50 == 0:
-                    print(f"   Epoch {ep+1}/{epochs} - Template {idx+1}/{len(templates)}", end='\r')
+                    loss = loss_r + loss_p
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+                    total_loss += loss.item()
+                    n += 1
+                except Exception as ex:
+                    print(f"   ⚠️ Erreur template {idx}: {ex}", flush=True)
+                    continue
 
             epoch_time = time.time() - epoch_start
-            print(f"   Epoch {ep+1:2d}/{epochs} - Loss: {total_loss/n:.4f} - {epoch_time:.1f}s")
+            print(f"   Epoch {ep+1:2d}/{epochs} - Loss: {total_loss/n:.4f} - {epoch_time:.1f}s", flush=True)
+            sys.stdout.flush()
 
         total_time = time.time() - start_time
-        print(f"✅ GNN entraîné en {total_time:.1f}s")
+        print(f"✅ GNN entraîné en {total_time:.1f}s", flush=True)
         return model
 
     def score_gnn(model, seq, coords):
