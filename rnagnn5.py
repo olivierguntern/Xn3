@@ -247,20 +247,37 @@ def align_sequences(seq1, seq2):
 print(f"✅ Alignement: {'BioPython' if BIOPYTHON_OK else 'Fallback NW'}")
 
 # %% [markdown]
-# ## 🔍 8. Recherche de templates (étendue)
+# ## 🔍 8. Recherche de templates (OPTIMISÉE avec k-mer)
 
 # %%
+def kmer_similarity(seq1, seq2, k=4):
+    """Similarité k-mer ultra-rapide O(n+m)."""
+    if len(seq1) < k or len(seq2) < k:
+        return sum(a == b for a, b in zip(seq1, seq2)) / max(len(seq1), len(seq2), 1)
+
+    kmers1 = set(seq1[i:i+k] for i in range(len(seq1) - k + 1))
+    kmers2 = set(seq2[i:i+k] for i in range(len(seq2) - k + 1))
+
+    if not kmers1 or not kmers2:
+        return 0.0
+
+    return len(kmers1 & kmers2) / len(kmers1 | kmers2)
+
 def find_templates(query_seq, seqs_df, coords_dict, temporal_cutoff=None, top_n=10):
     """
-    Recherche étendue: top_n=10 pour plus de diversité.
+    Recherche RAPIDE avec pré-filtrage k-mer.
+    1. Filtre longueur
+    2. Pré-filtre k-mer (top 25 candidats)
+    3. Alignement complet sur les meilleurs seulement
     """
-    results = []
-
+    # Filtre temporal
     if temporal_cutoff is not None and 'temporal_cutoff' in seqs_df.columns:
         filtered = seqs_df[seqs_df['temporal_cutoff'] < temporal_cutoff]
     else:
         filtered = seqs_df
 
+    # ÉTAPE 1: Pré-filtrage rapide par k-mer
+    candidates = []
     for _, row in filtered.iterrows():
         tid = row['target_id']
         tseq = row['sequence']
@@ -268,13 +285,23 @@ def find_templates(query_seq, seqs_df, coords_dict, temporal_cutoff=None, top_n=
         if tid not in coords_dict:
             continue
 
-        # Filtre longueur
+        # Filtre longueur (40%)
         len_ratio = min(len(query_seq), len(tseq)) / max(len(query_seq), len(tseq))
-        if len_ratio < 0.5:
+        if len_ratio < 0.4:
             continue
 
-        sim, aq, at = align_sequences(query_seq, tseq)
+        # K-mer rapide
+        kmer_sim = kmer_similarity(query_seq, tseq, k=4)
+        candidates.append((tid, tseq, kmer_sim))
 
+    # ÉTAPE 2: Garder top 25 par k-mer
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    candidates = candidates[:25]
+
+    # ÉTAPE 3: Alignement complet sur les meilleurs
+    results = []
+    for tid, tseq, _ in candidates:
+        sim, aq, at = align_sequences(query_seq, tseq)
         results.append({
             'target_id': tid,
             'sequence': tseq,
@@ -287,7 +314,7 @@ def find_templates(query_seq, seqs_df, coords_dict, temporal_cutoff=None, top_n=
     results.sort(key=lambda x: x['similarity'], reverse=True)
     return results[:top_n]
 
-print("✅ Recherche templates (top_n=10)")
+print("✅ Recherche templates OPTIMISÉE (k-mer + top 25)")
 
 # %% [markdown]
 # ## 🎯 9. Adaptation template
